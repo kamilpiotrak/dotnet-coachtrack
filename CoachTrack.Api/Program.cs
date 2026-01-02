@@ -1,10 +1,16 @@
-using System.Collections.Concurrent;
+using CoachTrack.Api.Data;
+using CoachTrack.Api.Models;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Swagger (API docs UI)
+// Swagger
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+// DB
+var cs = builder.Configuration.GetConnectionString("CoachTrackDb");
+builder.Services.AddDbContext<CoachTrackDbContext>(opt => opt.UseNpgsql(cs));
 
 var app = builder.Build();
 
@@ -14,87 +20,104 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-app.MapGet("/", () => "CoachTrack API is running. Use /health or /swagger");
+app.MapGet("/", () => "CoachTrack API is running. Use /swagger");
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
-// --------------------
-// In-memory storage (temporary, no database yet)
-// --------------------
-var clients = new ConcurrentDictionary<Guid, Client>();
-
-// Create a client
-app.MapPost("/clients", (CreateClientRequest req) =>
+// Create client
+app.MapPost("/clients", async (CoachTrackDbContext db, CreateClientRequest req) =>
 {
     if (string.IsNullOrWhiteSpace(req.Name))
         return Results.BadRequest(new { error = "Name is required." });
 
-    var client = new Client(
-        Id: Guid.NewGuid(),
-        Name: req.Name.Trim(),
-        StartDate: DateOnly.FromDateTime(DateTime.UtcNow),
-        CheckIns: new List<CheckIn>()
-    );
+    var client = new Client
+    {
+        Id = Guid.NewGuid(),
+        Name = req.Name.Trim(),
+        StartDateUtc = DateTime.UtcNow
+    };
 
-    clients[client.Id] = client;
+    db.Clients.Add(client);
+    await db.SaveChangesAsync();
+
     return Results.Created($"/clients/{client.Id}", client);
 });
 
 // List clients
-app.MapGet("/clients", () => Results.Ok(clients.Values.OrderByDescending(c => c.StartDate)));
-
-// Add a check-in for a client
-app.MapPost("/clients/{clientId:guid}/checkins", (Guid clientId, CreateCheckInRequest req) =>
+app.MapGet("/clients", async (CoachTrackDbContext db) =>
 {
-    if (!clients.TryGetValue(clientId, out var client))
+    var clients = await db.Clients
+        .OrderByDescending(c => c.StartDateUtc)
+        .ToListAsync();
+
+    return Results.Ok(clients);
+});
+
+// Get single client (with check-ins)
+app.MapGet("/clients/{clientId:guid}", async (CoachTrackDbContext db, Guid clientId) =>
+{
+    var client = await db.Clients
+        .Include(c => c.CheckIns)
+        .FirstOrDefaultAsync(c => c.Id == clientId);
+
+    return client is null
+        ? Results.NotFound(new { error = "Client not found." })
+        : Results.Ok(client);
+});
+
+// Delete client
+app.MapDelete("/clients/{clientId:guid}", async (CoachTrackDbContext db, Guid clientId) =>
+{
+    var client = await db.Clients.FirstOrDefaultAsync(c => c.Id == clientId);
+    if (client is null)
+        return Results.NotFound(new { error = "Client not found." });
+
+    db.Clients.Remove(client);
+    await db.SaveChangesAsync();
+
+    return Results.NoContent();
+});
+
+// Add check-in
+app.MapPost("/clients/{clientId:guid}/checkins", async (CoachTrackDbContext db, Guid clientId, CreateCheckInRequest req) =>
+{
+    var clientExists = await db.Clients.AnyAsync(c => c.Id == clientId);
+    if (!clientExists)
         return Results.NotFound(new { error = "Client not found." });
 
     if (req.WeightKg <= 0)
         return Results.BadRequest(new { error = "WeightKg must be > 0." });
 
-    var checkIn = new CheckIn(
-        Id: Guid.NewGuid(),
-        Date: DateOnly.FromDateTime(DateTime.UtcNow),
-        WeightKg: req.WeightKg,
-        Notes: req.Notes?.Trim()
-    );
+    var checkIn = new CheckIn
+    {
+        Id = Guid.NewGuid(),
+        ClientId = clientId,
+        DateUtc = DateTime.UtcNow,
+        WeightKg = req.WeightKg,
+        Notes = req.Notes?.Trim()
+    };
 
-    client.CheckIns.Add(checkIn);
+    db.CheckIns.Add(checkIn);
+    await db.SaveChangesAsync();
+
     return Results.Created($"/clients/{clientId}/checkins/{checkIn.Id}", checkIn);
 });
 
-// List check-ins for a client
-app.MapGet("/clients/{clientId:guid}/checkins", (Guid clientId) =>
+// List check-ins
+app.MapGet("/clients/{clientId:guid}/checkins", async (CoachTrackDbContext db, Guid clientId) =>
 {
-    if (!clients.TryGetValue(clientId, out var client))
+    var clientExists = await db.Clients.AnyAsync(c => c.Id == clientId);
+    if (!clientExists)
         return Results.NotFound(new { error = "Client not found." });
 
-    return Results.Ok(client.CheckIns.OrderByDescending(c => c.Date));
+    var checkIns = await db.CheckIns
+        .Where(ci => ci.ClientId == clientId)
+        .OrderByDescending(ci => ci.DateUtc)
+        .ToListAsync();
+
+    return Results.Ok(checkIns);
 });
-
-// Get one client
-app.MapGet("/clients/{clientId:guid}", (Guid clientId) =>
-{
-    return clients.TryGetValue(clientId, out var client)
-        ? Results.Ok(client)
-        : Results.NotFound(new { error = "Client not found." });
-});
-
-// Delete one client
-app.MapDelete("/clients/{clientId:guid}", (Guid clientId) =>
-{
-    return clients.TryRemove(clientId, out _)
-        ? Results.NoContent()
-        : Results.NotFound(new { error = "Client not found." });
-});
-
-
 
 app.Run();
 
-// --------------------
-// Models (kept here for simplicity)
-// --------------------
 record CreateClientRequest(string Name);
 record CreateCheckInRequest(decimal WeightKg, string? Notes);
-record Client(Guid Id, string Name, DateOnly StartDate, List<CheckIn> CheckIns);
-record CheckIn(Guid Id, DateOnly Date, decimal WeightKg, string? Notes);

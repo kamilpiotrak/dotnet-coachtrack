@@ -1,0 +1,15 @@
+﻿services:
+  db:
+    image: postgres:16
+    container_name: coachtrack-db
+    environment:
+      POSTGRES_DB: coachtrack
+      POSTGRES_USER: coachtrack
+      POSTGRES_PASSWORD: coachtrackpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - coachtrack_pgdata:/var/lib/postgresql/data
+
+volumes:
+  coachtrack_pgdata:
